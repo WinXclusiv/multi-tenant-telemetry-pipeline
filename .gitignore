@@ -1,0 +1,26 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+tfplan
+crash.log
+# NOTE: .terraform.lock.hcl is intentionally committed (pins provider versions)
+
+# Build artifacts
+build/
+*.zip
+
+# Python
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Editor settings (may name your local AWS profile)
+.vscode/
+
+# Secrets
+.env
+aws_creds.json

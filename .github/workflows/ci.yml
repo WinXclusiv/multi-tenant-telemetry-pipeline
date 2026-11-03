@@ -1,0 +1,171 @@
+name: CI
+
+# Runs on every PR (checks + plan) and on pushes to main (checks only).
+# Nothing in this workflow can change AWS: the plan job assumes a read-only role.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.17.0"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  python:
+    name: Python lint & tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Unit tests (moto-mocked AWS)
+        run: pytest -v
+
+  terraform-static:
+    name: Terraform fmt, validate, lint, security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform validate (pipeline)
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: terraform validate (bootstrap)
+        working-directory: bootstrap
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - uses: terraform-linters/setup-tflint@v6
+
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when downloading the AWS ruleset
+        run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+
+      - name: checkov security scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          config_file: .checkov.yaml
+
+  plan:
+    name: Terraform plan
+    needs: [python, terraform-static]
+    # Fork PRs get no OIDC token, so only plan for branches in this repo.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # lets the job request a GitHub OIDC token
+      pull-requests: write # lets the job comment the plan on the PR
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_lambda_permissions_boundary_arn: ${{ vars.LAMBDA_BOUNDARY_ARN }}
+      TF_VAR_page_topic_arn: ${{ vars.ALERT_PAGE_TOPIC_ARN }}
+      TF_VAR_ticket_topic_arn: ${{ vars.ALERT_TICKET_TOPIC_ARN }}
+      TF_VAR_runbook_base_url: ${{ github.server_url }}/${{ github.repository }}/blob/main/docs/runbooks
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (read-only plan role via OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-plan-${{ github.run_id }}
+
+      - name: terraform init
+        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -input=false -no-color -lock-timeout=120s -out=tfplan | tee plan.log
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Comment plan on PR
+        if: always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@v9
+        env:
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- terraform-plan -->';
+            const ok = process.env.PLAN_OUTCOME === 'success';
+            const file = fs.existsSync('plan.txt') ? 'plan.txt' : 'plan.log';
+            let plan = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : 'No plan output.';
+            const summary = (plan.match(/^(Plan: .*|No changes\..*)$/m) || ['Plan failed, see details'])[0];
+            if (plan.length > 60000) plan = plan.slice(0, 60000) + '\n... (truncated, see workflow logs)';
+            const sha = context.payload.pull_request.head.sha.substring(0, 7);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              marker,
+              `### Terraform plan ${ok ? '✅' : '❌'}`,
+              `**${summary}**`,
+              '<details><summary>Show full plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '</details>',
+              '',
+              `_Commit ${sha} · [workflow run](${runUrl})_`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }

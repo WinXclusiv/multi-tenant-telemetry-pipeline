@@ -1,0 +1,8 @@
+# Intentional exceptions are documented inline next to each resource
+# (#checkov:skip=<ID>:<reason>) so reviewers see the justification in context.
+framework:
+  - terraform
+skip-path:
+  - build
+compact: true
+quiet: true

@@ -1,0 +1,20 @@
+[project]
+name = "multi-tenant-telemetry-pipeline"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "src/lambda_consumer", "scripts"]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning:botocore.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+ignore = ["S311"] # random is fine for mock telemetry
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]

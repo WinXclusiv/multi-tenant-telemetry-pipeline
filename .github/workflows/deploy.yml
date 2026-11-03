@@ -1,0 +1,82 @@
+name: Deploy
+
+# Manual trigger from the Actions tab. The `sandbox` environment requires a
+# reviewer to approve before the job starts, and only main can deploy.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-state # never run two state-changing jobs at once
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.17.0"
+  PYTHON_VERSION: "3.12"
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+  TF_VAR_lambda_permissions_boundary_arn: ${{ vars.LAMBDA_BOUNDARY_ARN }}
+  TF_VAR_page_topic_arn: ${{ vars.ALERT_PAGE_TOPIC_ARN }}
+  TF_VAR_ticket_topic_arn: ${{ vars.ALERT_TICKET_TOPIC_ARN }}
+  TF_VAR_runbook_base_url: ${{ github.server_url }}/${{ github.repository }}/blob/main/docs/runbooks
+
+jobs:
+  deploy:
+    name: Apply + smoke test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (deploy role via OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - name: terraform init
+        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: terraform plan
+        run: terraform plan -input=false -no-color -lock-timeout=120s -out=tfplan
+
+      - name: terraform apply
+        run: terraform apply -input=false -no-color -lock-timeout=120s tfplan
+
+      - name: Smoke test (Kinesis -> Lambda -> S3)
+        run: |
+          python scripts/smoke_test.py \
+            --stream "$(terraform output -raw stream_name)" \
+            --bucket "$(terraform output -raw bucket_name)" \
+            --mapping-uuid "$(terraform output -raw event_source_mapping_uuid)" \
+            --region "${{ vars.AWS_REGION }}"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Deployment"
+            echo '```'
+            terraform output 2>/dev/null || echo "No outputs (apply may have failed)"
+            echo '```'
+            echo "> Kinesis shards bill per hour while deployed. Run the **Destroy** workflow when done."
+          } >> "$GITHUB_STEP_SUMMARY"

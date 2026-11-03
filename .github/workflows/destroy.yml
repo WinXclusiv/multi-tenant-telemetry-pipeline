@@ -1,0 +1,79 @@
+name: Destroy
+
+# Manual teardown (type "destroy" to confirm), plus a nightly safety net so a
+# forgotten deployment never runs up shard-hours. Uses the `sandbox-teardown`
+# environment, which has no required reviewer so the scheduled run isn't blocked.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to tear down all pipeline resources'
+        required: true
+  schedule:
+    - cron: "0 5 * * *" # 05:00 UTC = 1:00 AM Eastern (EDT)
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-state
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.17.0"
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+  TF_VAR_lambda_permissions_boundary_arn: ${{ vars.LAMBDA_BOUNDARY_ARN }}
+  TF_VAR_page_topic_arn: ${{ vars.ALERT_PAGE_TOPIC_ARN }}
+  TF_VAR_ticket_topic_arn: ${{ vars.ALERT_TICKET_TOPIC_ARN }}
+  TF_VAR_runbook_base_url: ${{ github.server_url }}/${{ github.repository }}/blob/main/docs/runbooks
+
+jobs:
+  destroy:
+    name: terraform destroy
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      vars.TF_STATE_BUCKET != '' &&
+      (github.event_name == 'schedule' || inputs.confirm == 'destroy')
+    runs-on: ubuntu-latest
+    environment: sandbox-teardown
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (deploy role via OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-destroy-${{ github.run_id }}
+
+      - name: terraform init
+        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: Check for deployed resources
+        id: state
+        run: |
+          count=$(terraform state list 2>/dev/null | wc -l)
+          echo "resources=$count" >> "$GITHUB_OUTPUT"
+          echo "Resources in state: $count"
+
+      - name: terraform destroy
+        if: steps.state.outputs.resources != '0'
+        run: terraform destroy -input=false -no-color -auto-approve -lock-timeout=120s
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ "${{ steps.state.outputs.resources }}" = "0" ]; then
+            echo "Nothing deployed; no action taken." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Destroyed ${{ steps.state.outputs.resources }} resources (trigger: ${{ github.event_name }})." >> "$GITHUB_STEP_SUMMARY"
+          fi

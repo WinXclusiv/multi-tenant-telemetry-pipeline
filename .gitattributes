@@ -1,0 +1,6 @@
+# Keep LF line endings in the repo, even when edited on Windows.
+# (Terraform, Python and the Linux CI runners all expect LF.)
+* text=auto eol=lf
+*.zip binary
+*.png binary
+*.pdf binary
