@@ -40,3 +40,15 @@ variable "alert_email" {
   default     = ""
   description = "Email that receives page and ticket alerts. AWS sends a confirmation link once; empty = no subscription."
 }
+
+variable "github_owner_id" {
+  type        = number
+  default     = null
+  description = "Numeric GitHub user/org ID. Set it, with github_repo_id, for repos that use GitHub's immutable OIDC subject format (all repos created after July 15, 2026)."
+}
+
+variable "github_repo_id" {
+  type        = number
+  default     = null
+  description = "Numeric GitHub repository ID"
+}

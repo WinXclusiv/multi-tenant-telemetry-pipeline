@@ -38,6 +38,13 @@ locals {
   repo      = "${var.github_owner}/${var.github_repo}"
   glue_db   = replace("${var.project}_db", "-", "_")
 
+  # Subject used in the OIDC trust policies. Repos created after July 15, 2026 get
+  # GitHub's immutable format, which pins the owner and repo IDs:
+  #   repo:<owner>@<owner_id>/<repo>@<repo_id>:...
+  # A deleted-and-recreated repo with the same name can't match the IDs.
+  immutable_ids = var.github_owner_id != null && var.github_repo_id != null
+  repo_subject  = local.immutable_ids ? "${var.github_owner}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}" : local.repo
+
   # Deliberately NOT prefixed with var.project, so the deploy role's
   # "${var.project}-*" permissions can't touch the state bucket or its own role.
   state_bucket = "tfstate-${var.project}-${random_id.suffix.hex}"
@@ -208,7 +215,7 @@ data "aws_iam_policy_document" "trust_plan" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${local.repo}:pull_request"]
+      values   = ["repo:${local.repo_subject}:pull_request"]
     }
   }
 }
@@ -230,8 +237,8 @@ data "aws_iam_policy_document" "trust_deploy" {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
       values = [
-        "repo:${local.repo}:environment:sandbox",
-        "repo:${local.repo}:environment:sandbox-teardown",
+        "repo:${local.repo_subject}:environment:sandbox",
+        "repo:${local.repo_subject}:environment:sandbox-teardown",
       ]
     }
   }
